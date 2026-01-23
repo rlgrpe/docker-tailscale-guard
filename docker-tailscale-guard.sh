@@ -291,7 +291,7 @@ apply_rules_atomic() {
     fi
 
     local rules_file
-    rules_file=$(mktemp)
+    rules_file=$(mktemp -p /run)
     chmod 600 "$rules_file"  # Secure temp file permissions
 
     # Ensure cleanup on exit/signals (security: prevent temp file leakage)
@@ -399,7 +399,7 @@ apply_rules_atomic_ipv6() {
     fi
 
     local rules_file
-    rules_file=$(mktemp)
+    rules_file=$(mktemp -p /run)
     chmod 600 "$rules_file"  # Secure temp file permissions
 
     # Ensure cleanup on exit/signals (security: prevent temp file leakage)
