@@ -37,8 +37,9 @@ ExecStop=/bin/true
 NoNewPrivileges=no
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=no
 ReadWritePaths=/var/log
+RuntimeDirectory=docker-tailscale-guard
+Environment=TMPDIR=/run/docker-tailscale-guard
 
 [Install]
 WantedBy=multi-user.target
