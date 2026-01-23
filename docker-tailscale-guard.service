@@ -1,0 +1,43 @@
+[Unit]
+Description=Docker Tailscale Guard - Firewall for Docker containers
+Documentation=https://github.com/user/docker-tailscale-guard
+
+# Start after Docker and Tailscale are ready
+After=network-online.target docker.service tailscaled.service
+Wants=network-online.target
+Requires=docker.service
+
+# Restart when Docker restarts (propagates stop/restart)
+PartOf=docker.service
+
+# Also restart if Docker is reloaded
+ReloadPropagatedFrom=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Environment file for configuration (optional)
+EnvironmentFile=-/etc/docker-tailscale-guard.conf
+
+# Small delay to ensure Docker chains are fully initialized
+ExecStartPre=/bin/sleep 2
+
+# Main execution
+ExecStart=/usr/local/sbin/docker-tailscale-guard.sh apply guarded
+
+# Re-apply rules on reload
+ExecReload=/usr/local/sbin/docker-tailscale-guard.sh apply guarded
+
+# Safe stop: leave firewall rules in place to maintain protection
+# If service crashes or stops, containers remain protected
+ExecStop=/bin/true
+
+# Hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log
+
+[Install]
+WantedBy=multi-user.target

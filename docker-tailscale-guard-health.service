@@ -1,0 +1,11 @@
+[Unit]
+Description=Docker Tailscale Guard Health Check and Auto-Recovery
+After=docker-tailscale-guard.service
+Requires=docker-tailscale-guard.service
+
+# Auto-recovery: restart main service if health check fails
+OnFailure=docker-tailscale-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/docker-tailscale-guard.sh health
