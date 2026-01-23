@@ -37,7 +37,8 @@ ExecStop=/bin/true
 NoNewPrivileges=no
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log /tmp
+PrivateTmp=no
+ReadWritePaths=/var/log
 
 [Install]
 WantedBy=multi-user.target
