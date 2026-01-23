@@ -79,7 +79,10 @@ fi
 # Create temp directory for downloads if remote install
 TEMP_DIR=""
 if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/docker-tailscale-guard.sh" ]]; then
-    TEMP_DIR=$(mktemp -d)
+    INSTALL_TMPDIR="${TMPDIR:-/run/docker-tailscale-guard}"
+    mkdir -p "$INSTALL_TMPDIR"
+    chmod 700 "$INSTALL_TMPDIR"
+    TEMP_DIR=$(mktemp -d -p "$INSTALL_TMPDIR")
     trap 'rm -rf "$TEMP_DIR"' EXIT
     SCRIPT_DIR="$TEMP_DIR"
 

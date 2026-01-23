@@ -37,7 +37,7 @@ ExecStop=/bin/true
 NoNewPrivileges=no
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log
+ReadWritePaths=/var/log /run/docker-tailscale-guard
 RuntimeDirectory=docker-tailscale-guard
 Environment=TMPDIR=/run/docker-tailscale-guard
 

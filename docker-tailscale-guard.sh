@@ -203,6 +203,16 @@ validate_ipv6_cidr() {
     (( prefix >= 0 && prefix <= 128 ))
 }
 
+# Ensure a writable temp directory for mktemp
+ensure_tmpdir() {
+    local dir="${TMPDIR:-/run/docker-tailscale-guard}"
+    if [[ -z "$dir" ]]; then
+        dir="/run"
+    fi
+    mkdir -p "$dir" 2>/dev/null || true
+    echo "$dir"
+}
+
 # ============================================================================
 # IPTABLES FUNCTIONS
 # ============================================================================
@@ -291,7 +301,7 @@ apply_rules_atomic() {
     fi
 
     local rules_file
-    rules_file=$(mktemp -p /run)
+    rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
 
     # Ensure cleanup on exit/signals (security: prevent temp file leakage)
@@ -399,7 +409,7 @@ apply_rules_atomic_ipv6() {
     fi
 
     local rules_file
-    rules_file=$(mktemp -p /run)
+    rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
 
     # Ensure cleanup on exit/signals (security: prevent temp file leakage)
