@@ -16,11 +16,11 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================================================
 
-# Ports to expose publicly (TCP)
-PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS:-80,443}"
+# Ports to expose publicly (TCP) - default: none (locked mode)
+PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS:-none}"
 
-# Ports to expose publicly (UDP)
-PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-443}"
+# Ports to expose publicly (UDP) - default: none (locked mode)
+PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-none}"
 
 # Tailscale interface (auto-detected if empty)
 TS_IFACE="${TS_IFACE:-}"

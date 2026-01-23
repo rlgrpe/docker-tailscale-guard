@@ -23,11 +23,11 @@ EnvironmentFile=-/etc/docker-tailscale-guard.conf
 # Small delay to ensure Docker chains are fully initialized
 ExecStartPre=/bin/sleep 2
 
-# Main execution
-ExecStart=/usr/local/sbin/docker-tailscale-guard.sh apply guarded
+# Main execution (locked mode = Tailscale-only by default)
+ExecStart=/usr/local/sbin/docker-tailscale-guard.sh apply
 
 # Re-apply rules on reload
-ExecReload=/usr/local/sbin/docker-tailscale-guard.sh apply guarded
+ExecReload=/usr/local/sbin/docker-tailscale-guard.sh apply
 
 # Safe stop: leave firewall rules in place to maintain protection
 # If service crashes or stops, containers remain protected
