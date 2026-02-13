@@ -4,6 +4,11 @@
 #
 set -euo pipefail
 
+if [[ -z "${BASH_VERSION:-}" ]]; then
+    echo "Error: This script requires bash. Run with: bash install.sh"
+    exit 1
+fi
+
 REPO_URL="https://raw.githubusercontent.com/rlgrpe/docker-tailscale-guard/main"
 
 echo "=== Docker Tailscale Guard Installer ==="
@@ -30,6 +35,11 @@ get_file() {
         # Remote install
         echo "  Downloading $filename..."
         curl -fsSL "$REPO_URL/$filename" -o "$dest"
+        # Verify downloaded file is not empty or an error page
+        if [[ ! -s "$dest" ]]; then
+            echo "Error: Downloaded $filename is empty"
+            exit 1
+        fi
     fi
 }
 
@@ -97,6 +107,11 @@ fi
 
 # Install main script with secure permissions
 echo "Installing main script..."
+if ! head -1 "$SCRIPT_DIR/docker-tailscale-guard.sh" | grep -q '^#!/bin/bash'; then
+    echo "Error: Main script does not appear to be a valid shell script"
+    echo "       This may indicate a download failure"
+    exit 1
+fi
 install -m 750 "$SCRIPT_DIR/docker-tailscale-guard.sh" /usr/local/sbin/docker-tailscale-guard.sh
 echo "  [ok] Installed to /usr/local/sbin/docker-tailscale-guard.sh (mode 750)"
 
@@ -111,9 +126,9 @@ fi
 
 # Install systemd units
 echo "Installing systemd units..."
-cp "$SCRIPT_DIR/docker-tailscale-guard.service" /etc/systemd/system/
-cp "$SCRIPT_DIR/docker-tailscale-guard-health.service" /etc/systemd/system/
-cp "$SCRIPT_DIR/docker-tailscale-guard-health.timer" /etc/systemd/system/
+install -m 644 "$SCRIPT_DIR/docker-tailscale-guard.service" /etc/systemd/system/
+install -m 644 "$SCRIPT_DIR/docker-tailscale-guard-health.service" /etc/systemd/system/
+install -m 644 "$SCRIPT_DIR/docker-tailscale-guard-health.timer" /etc/systemd/system/
 echo "  [ok] Installed systemd service and timer"
 
 # Reload systemd
@@ -127,8 +142,16 @@ systemctl enable docker-tailscale-guard-health.timer
 
 # Start services
 echo "Starting services..."
-systemctl start docker-tailscale-guard.service
-systemctl start docker-tailscale-guard-health.timer
+if ! systemctl start docker-tailscale-guard.service 2>&1; then
+    echo ""
+    echo "WARNING: Firewall service failed to start!"
+    echo "  This usually means Tailscale is not connected yet."
+    echo "  Run 'tailscale up' and then: systemctl start docker-tailscale-guard"
+    echo ""
+    echo "  IMPORTANT: Docker containers are NOT yet protected."
+    echo ""
+fi
+systemctl start docker-tailscale-guard-health.timer 2>/dev/null || true
 
 echo ""
 echo "=== Installation Complete ==="
