@@ -9,8 +9,9 @@ Fault-tolerant firewall for Docker containers with Tailscale integration.
 - **Localhost preserved**: Containers can access localhost and communicate with each other
 - **Configurable public ports**: Expose specific ports to the public internet
 - **Multi-interface security**: Allowlist approach blocks ALL interfaces except explicitly allowed
-- **Auto-detection**: Automatically detects Tailscale interfaces and Docker networks
-- **Fault-tolerant**: Health checks with automatic recovery every 5 minutes
+- **Auto-detection**: Automatically detects Tailscale interfaces and Docker bridge interfaces
+- **Interface-based security**: Uses kernel-determined interface matching (cannot be spoofed)
+- **Fault-tolerant**: Health checks with automatic rule refresh and recovery every 5 minutes
 - **Safe service stop**: Firewall rules remain in place if service stops/crashes
 
 ## Quick Install
@@ -33,6 +34,29 @@ wget -qO- https://raw.githubusercontent.com/rlgrpe/docker-tailscale-guard/main/i
 git clone https://github.com/rlgrpe/docker-tailscale-guard.git
 cd docker-tailscale-guard
 sudo ./install.sh
+```
+
+## Update
+
+Re-run the installer — it updates the script and systemd units while preserving your configuration in `/etc/docker-tailscale-guard.conf`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rlgrpe/docker-tailscale-guard/main/install.sh | sudo bash
+```
+
+Or from a local clone:
+
+```bash
+cd docker-tailscale-guard
+git pull
+sudo ./install.sh
+```
+
+After update, verify:
+
+```bash
+sudo systemctl status docker-tailscale-guard
+sudo docker-tailscale-guard.sh status
 ```
 
 ## Quick Uninstall
@@ -102,9 +126,15 @@ Uses the `DOCKER-USER` iptables chain with an allowlist approach:
 1. Allow established connections
 2. Allow Tailscale interface
 3. Allow loopback (localhost)
-4. Allow Docker networks (container-to-container)
+4. Allow Docker bridge interfaces (`docker0`, `br-*`)
 5. Allow configured public ports
 6. **Drop everything else**
+
+Interface matching (`-i`) is kernel-determined and cannot be spoofed by remote attackers.
+
+### Auto-refresh
+
+The health timer runs every 5 minutes and re-applies rules before running health checks. This automatically picks up new Docker networks and bridge interfaces without manual intervention.
 
 ## Troubleshooting
 
