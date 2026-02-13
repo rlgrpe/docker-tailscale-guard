@@ -387,6 +387,9 @@ EOF
     chmod 600 "$backup_file"
     iptables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
 
+    # Flush existing rules to prevent accumulation (iptables-restore -n does not flush chains)
+    iptables -F DOCKER-USER 2>/dev/null || true
+
     # Apply rules atomically
     local result=0
     if iptables-restore -n < "$rules_file"; then
@@ -496,6 +499,9 @@ EOF
     backup_file=$(mktemp -p "$(ensure_tmpdir)") || return 1
     chmod 600 "$backup_file"
     ip6tables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
+
+    # Flush existing rules to prevent accumulation (ip6tables-restore -n does not flush chains)
+    ip6tables -F DOCKER-USER 2>/dev/null || true
 
     # Apply rules atomically
     local result=0
@@ -733,8 +739,8 @@ Modes:
   open      Disable firewall (allow all traffic)
 
 Environment Variables:
-  PUBLIC_TCP_PORTS    TCP ports to expose publicly (default: 80,443)
-  PUBLIC_UDP_PORTS    UDP ports to expose publicly (default: 443)
+  PUBLIC_TCP_PORTS    TCP ports to expose publicly (default: none)
+  PUBLIC_UDP_PORTS    UDP ports to expose publicly (default: none)
   TS_IFACE            Tailscale interface (auto-detected)
 
 Examples:
