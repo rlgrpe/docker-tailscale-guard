@@ -108,28 +108,35 @@ detect_tailscale_interface() {
 # Returns comma-separated interface names for iptables -i matching
 # Dynamically detects actual Docker-managed bridges instead of wildcards
 detect_docker_interfaces() {
-    local ifaces="docker0,docker_gwbridge"
+    local ifaces=""
 
-    # docker0         — default bridge network
-    # docker_gwbridge — Swarm gateway bridge (container→internet for overlay networks)
+    # Include default bridges only if they actually exist on the host
+    for default_iface in docker0 docker_gwbridge; do
+        if ip link show "$default_iface" &>/dev/null; then
+            ifaces="${ifaces:+${ifaces},}${default_iface}"
+        fi
+    done
 
     # Detect actual Docker bridge interfaces (br-<network-id-prefix>)
-    # instead of overly broad "br-+" wildcard (security: prevents non-Docker
-    # bridges from being whitelisted)
     if command -v docker &>/dev/null; then
         local docker_bridges
         docker_bridges=$(docker network ls --format '{{.ID}}' 2>/dev/null | while read -r id; do
             local short_id="${id:0:12}"
             local br_name="br-${short_id}"
-            # Only include if the interface actually exists on the host
-            if ip link show "$br_name" &>/dev/null; then
+            if ip link show "$br_name" &>/dev/null && validate_interface_name "$br_name"; then
                 echo "$br_name"
             fi
         done | sort -u | tr '\n' ',' | sed 's/,$//')
 
         if [[ -n "$docker_bridges" ]]; then
-            ifaces="${ifaces},${docker_bridges}"
+            ifaces="${ifaces:+${ifaces},}${docker_bridges}"
         fi
+    fi
+
+    # Fallback: if nothing detected, use docker0 (iptables ignores non-existent interfaces)
+    if [[ -z "$ifaces" ]]; then
+        log_warn "No Docker bridge interfaces detected; using docker0 as fallback"
+        ifaces="docker0"
     fi
 
     echo "$ifaces"
@@ -252,6 +259,7 @@ apply_rules_atomic() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
+    local docker_ifaces="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -288,13 +296,13 @@ apply_rules_atomic() {
 # Security: interface names cannot be spoofed (kernel-determined)
 EOF
 
-    # Add Docker bridge interface rules (primary: operational)
-    local docker_ifaces
-    docker_ifaces=$(detect_docker_interfaces)
+    # Add Docker bridge interface rules
     IFS=',' read -ra IFACES <<< "$docker_ifaces"
     for iface in "${IFACES[@]}"; do
-        if [[ -n "$iface" ]]; then
+        if [[ -n "$iface" ]] && validate_interface_name "$iface"; then
             echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
+        else
+            log_warn "Skipping invalid Docker interface: ${iface:-empty}"
         fi
     done
 
@@ -362,6 +370,7 @@ apply_rules_atomic_ipv6() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
+    local docker_ifaces="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -394,12 +403,12 @@ apply_rules_atomic_ipv6() {
 EOF
 
     # Add Docker bridge interface rules
-    local docker_ifaces
-    docker_ifaces=$(detect_docker_interfaces)
     IFS=',' read -ra IFACES <<< "$docker_ifaces"
     for iface in "${IFACES[@]}"; do
-        if [[ -n "$iface" ]]; then
+        if [[ -n "$iface" ]] && validate_interface_name "$iface"; then
             echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
+        else
+            log_warn "Skipping invalid Docker interface: ${iface:-empty}"
         fi
     done
 
@@ -477,12 +486,16 @@ apply_firewall() {
     # Validate Tailscale interface exists
     validate_interface "$ts_iface" || die "Tailscale interface '$ts_iface' does not exist"
 
+    # Detect Docker bridge interfaces once (avoid race between IPv4 and IPv6 application)
+    local docker_ifaces
+    docker_ifaces=$(detect_docker_interfaces)
+
     # Log detected configuration
     local wan_iface
     wan_iface=$(detect_wan_interface)
     log_info "WAN interface (detected): ${wan_iface:-NOT DETECTED}"
     log_info "Tailscale interface: $ts_iface"
-    log_info "Docker interfaces: $(detect_docker_interfaces)"
+    log_info "Docker interfaces: $docker_ifaces"
 
     # Ensure chains exist (IPv4 and IPv6)
     ensure_docker_user_chain
@@ -493,13 +506,13 @@ apply_firewall() {
             # Default: Tailscale + specified public ports
             log_info "Public TCP ports: $PUBLIC_TCP_PORTS"
             log_info "Public UDP ports: $PUBLIC_UDP_PORTS"
-            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS"
-            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS"
+            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces"
+            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces"
             ;;
         locked)
             # Only Tailscale, no public ports
-            apply_rules_atomic "$ts_iface" "none" "none"
-            apply_rules_atomic_ipv6 "$ts_iface" "none" "none"
+            apply_rules_atomic "$ts_iface" "none" "none" "$docker_ifaces"
+            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_ifaces"
             ;;
         open)
             # Allow everything (bypass firewall)
