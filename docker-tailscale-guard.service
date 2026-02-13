@@ -34,9 +34,17 @@ ExecReload=/usr/local/sbin/docker-tailscale-guard.sh apply
 ExecStop=/bin/true
 
 # Hardening
-NoNewPrivileges=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
 ProtectSystem=strict
 ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
 ReadWritePaths=/var/log /run/docker-tailscale-guard
 RuntimeDirectory=docker-tailscale-guard
 Environment=TMPDIR=/run/docker-tailscale-guard
