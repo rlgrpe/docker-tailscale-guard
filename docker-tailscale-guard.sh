@@ -107,9 +107,12 @@ detect_tailscale_interface() {
     # Method 2: Any interface starting with tailscale
     elif iface=$(ip -o link show 2>/dev/null | grep -oP 'tailscale\w*' | head -1) && [[ -n "$iface" ]]; then
         : # iface already set
-    # Method 3: Check for userspace tailscale (tun)
+    # Method 3: Check for userspace tailscale (tun) -- verify with Tailscale IP
     elif ip link show tun0 &>/dev/null && pgrep -x tailscaled &>/dev/null; then
-        iface="tun0"
+        # Confirm tun0 is actually Tailscale by checking for 100.x.x.x address
+        if ip addr show tun0 2>/dev/null | grep -q 'inet 100\.'; then
+            iface="tun0"
+        fi
     fi
 
     echo "$iface"
