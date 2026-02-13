@@ -176,7 +176,13 @@ ensure_tmpdir() {
     if [[ -z "$dir" ]]; then
         dir="/run"
     fi
-    mkdir -p "$dir" 2>/dev/null || true
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        dir="/tmp"
+        if ! mkdir -p "$dir" 2>/dev/null; then
+            log_error "Cannot create temporary directory"
+            return 1
+        fi
+    fi
     echo "$dir"
 }
 
@@ -226,11 +232,15 @@ wait_for_docker_ready() {
 ensure_docker_user_chain() {
     if ! iptables -L DOCKER-USER -n &>/dev/null; then
         log_info "Creating DOCKER-USER chain (IPv4)"
-        iptables -N DOCKER-USER 2>/dev/null || true
-
-        # Insert jump to DOCKER-USER at the beginning of FORWARD chain if not exists
+        if ! iptables -N DOCKER-USER 2>&1; then
+            log_error "Failed to create DOCKER-USER chain (IPv4)"
+            return 1
+        fi
         if ! iptables -C FORWARD -j DOCKER-USER &>/dev/null; then
-            iptables -I FORWARD 1 -j DOCKER-USER 2>/dev/null || true
+            if ! iptables -I FORWARD 1 -j DOCKER-USER 2>&1; then
+                log_error "Failed to insert DOCKER-USER jump in FORWARD chain (IPv4)"
+                return 1
+            fi
         fi
     fi
 }
@@ -239,19 +249,29 @@ ensure_docker_user_chain() {
 ensure_docker_user_chain_ipv6() {
     if ! ip6tables -L DOCKER-USER -n &>/dev/null; then
         log_info "Creating DOCKER-USER chain (IPv6)"
-        ip6tables -N DOCKER-USER 2>/dev/null || true
-
-        # Insert jump to DOCKER-USER at the beginning of FORWARD chain if not exists
+        if ! ip6tables -N DOCKER-USER 2>&1; then
+            log_error "Failed to create DOCKER-USER chain (IPv6)"
+            return 1
+        fi
         if ! ip6tables -C FORWARD -j DOCKER-USER &>/dev/null; then
-            ip6tables -I FORWARD 1 -j DOCKER-USER 2>/dev/null || true
+            if ! ip6tables -I FORWARD 1 -j DOCKER-USER 2>&1; then
+                log_error "Failed to insert DOCKER-USER jump in FORWARD chain (IPv6)"
+                return 1
+            fi
         fi
     fi
 }
 
 # Flush DOCKER-USER chain safely (IPv4 and IPv6)
 flush_docker_user() {
-    iptables -F DOCKER-USER 2>/dev/null || true
-    ip6tables -F DOCKER-USER 2>/dev/null || true
+    if ! iptables -F DOCKER-USER 2>&1; then
+        log_error "Failed to flush DOCKER-USER chain (IPv4)"
+        return 1
+    fi
+    if ! ip6tables -F DOCKER-USER 2>&1; then
+        log_error "Failed to flush DOCKER-USER chain (IPv6)"
+        return 1
+    fi
 }
 
 # Apply rules atomically using iptables-restore (allowlist approach)
@@ -498,27 +518,31 @@ apply_firewall() {
     log_info "Docker interfaces: $docker_ifaces"
 
     # Ensure chains exist (IPv4 and IPv6)
-    ensure_docker_user_chain
-    ensure_docker_user_chain_ipv6
+    ensure_docker_user_chain || die "Failed to ensure DOCKER-USER chain (IPv4)"
+    ensure_docker_user_chain_ipv6 || die "Failed to ensure DOCKER-USER chain (IPv6)"
 
     case "$mode" in
         guarded)
             # Default: Tailscale + specified public ports
             log_info "Public TCP ports: $PUBLIC_TCP_PORTS"
             log_info "Public UDP ports: $PUBLIC_UDP_PORTS"
-            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces"
-            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces"
+            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces" \
+                || die "Failed to apply IPv4 firewall rules"
+            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces" \
+                || die "Failed to apply IPv6 firewall rules"
             ;;
         locked)
             # Only Tailscale, no public ports
-            apply_rules_atomic "$ts_iface" "none" "none" "$docker_ifaces"
-            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_ifaces"
+            apply_rules_atomic "$ts_iface" "none" "none" "$docker_ifaces" \
+                || die "Failed to apply IPv4 firewall rules"
+            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_ifaces" \
+                || die "Failed to apply IPv6 firewall rules"
             ;;
         open)
             # Allow everything (bypass firewall)
-            flush_docker_user
-            iptables -A DOCKER-USER -j RETURN
-            ip6tables -A DOCKER-USER -j RETURN
+            flush_docker_user || die "Failed to flush firewall rules for open mode"
+            iptables -A DOCKER-USER -j RETURN || die "Failed to add IPv4 RETURN rule"
+            ip6tables -A DOCKER-USER -j RETURN || die "Failed to add IPv6 RETURN rule"
             log_info "Firewall opened - all traffic allowed (IPv4 and IPv6)"
             ;;
         *)
