@@ -291,9 +291,6 @@ apply_rules_atomic() {
     rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
 
-    # Ensure cleanup on exit/signals (security: prevent temp file leakage)
-    trap 'rm -f "$rules_file" 2>/dev/null' EXIT
-
     # Build DOCKER-USER rules (allowlist approach - allow safe, drop everything else)
     cat > "$rules_file" <<EOF
 *filter
@@ -370,18 +367,32 @@ EOF
 COMMIT
 EOF
 
+    # Backup current rules before attempting changes
+    local backup_file
+    backup_file=$(mktemp -p "$(ensure_tmpdir)") || return 1
+    chmod 600 "$backup_file"
+    iptables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
+
     # Apply rules atomically
     local result=0
     if iptables-restore -n < "$rules_file"; then
         log_info "IPv4 rules applied successfully"
     else
-        log_error "Failed to apply IPv4 rules"
+        log_error "Failed to apply IPv4 rules -- attempting rollback"
+        if [[ -s "$backup_file" ]]; then
+            if iptables-restore -n < "$backup_file" 2>/dev/null; then
+                log_warn "Rolled back to previous IPv4 rules"
+            else
+                log_error "CRITICAL: IPv4 rollback failed. DOCKER-USER chain may be empty. Run: docker-tailscale-guard.sh apply"
+            fi
+        else
+            log_error "CRITICAL: No backup available. DOCKER-USER chain may be empty."
+        fi
         result=1
     fi
 
-    # Cleanup handled by trap, but clear it to avoid affecting caller
-    rm -f "$rules_file" 2>/dev/null
-    trap - EXIT
+    # Explicit cleanup (no trap clobbering)
+    rm -f "$rules_file" "$backup_file" 2>/dev/null
     return $result
 }
 
@@ -401,9 +412,6 @@ apply_rules_atomic_ipv6() {
     local rules_file
     rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
-
-    # Ensure cleanup on exit/signals (security: prevent temp file leakage)
-    trap 'rm -f "$rules_file" 2>/dev/null' EXIT
 
     # Build DOCKER-USER rules for IPv6
     cat > "$rules_file" <<EOF
@@ -469,18 +477,32 @@ EOF
 COMMIT
 EOF
 
+    # Backup current rules before attempting changes
+    local backup_file
+    backup_file=$(mktemp -p "$(ensure_tmpdir)") || return 1
+    chmod 600 "$backup_file"
+    ip6tables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
+
     # Apply rules atomically
     local result=0
     if ip6tables-restore -n < "$rules_file"; then
         log_info "IPv6 rules applied successfully"
     else
-        log_error "Failed to apply IPv6 rules"
+        log_error "Failed to apply IPv6 rules -- attempting rollback"
+        if [[ -s "$backup_file" ]]; then
+            if ip6tables-restore -n < "$backup_file" 2>/dev/null; then
+                log_warn "Rolled back to previous IPv6 rules"
+            else
+                log_error "CRITICAL: IPv6 rollback failed. DOCKER-USER chain may be empty. Run: docker-tailscale-guard.sh apply"
+            fi
+        else
+            log_error "CRITICAL: No backup available. DOCKER-USER chain may be empty."
+        fi
         result=1
     fi
 
-    # Cleanup handled by trap, but clear it to avoid affecting caller
-    rm -f "$rules_file" 2>/dev/null
-    trap - EXIT
+    # Explicit cleanup (no trap clobbering)
+    rm -f "$rules_file" "$backup_file" 2>/dev/null
     return $result
 }
 
