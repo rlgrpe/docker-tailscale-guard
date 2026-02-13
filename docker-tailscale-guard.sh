@@ -25,9 +25,6 @@ PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-none}"
 # Tailscale interface (auto-detected if empty)
 TS_IFACE="${TS_IFACE:-}"
 
-# Docker networks to allow (comma-separated CIDR, auto-detected if empty)
-DOCKER_NETWORKS="${DOCKER_NETWORKS:-}"
-
 # Log file
 LOG_FILE="/var/log/docker-tailscale-guard.log"
 
@@ -107,40 +104,35 @@ detect_tailscale_interface() {
     echo "$iface"
 }
 
-# Detect Docker bridge networks (IPv4)
-detect_docker_networks() {
-    local networks=""
+# Detect Docker bridge interfaces
+# Returns comma-separated interface names for iptables -i matching
+# Dynamically detects actual Docker-managed bridges instead of wildcards
+detect_docker_interfaces() {
+    local ifaces="docker0,docker_gwbridge"
 
+    # docker0         — default bridge network
+    # docker_gwbridge — Swarm gateway bridge (container→internet for overlay networks)
+
+    # Detect actual Docker bridge interfaces (br-<network-id-prefix>)
+    # instead of overly broad "br-+" wildcard (security: prevents non-Docker
+    # bridges from being whitelisted)
     if command -v docker &>/dev/null; then
-        networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | \
-            xargs -I {} docker network inspect {} --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | \
-            grep -E '^[0-9]+\.' | sort -u | tr '\n' ',' | sed 's/,$//')
+        local docker_bridges
+        docker_bridges=$(docker network ls --format '{{.ID}}' 2>/dev/null | while read -r id; do
+            local short_id="${id:0:12}"
+            local br_name="br-${short_id}"
+            # Only include if the interface actually exists on the host
+            if ip link show "$br_name" &>/dev/null; then
+                echo "$br_name"
+            fi
+        done | sort -u | tr '\n' ',' | sed 's/,$//')
+
+        if [[ -n "$docker_bridges" ]]; then
+            ifaces="${ifaces},${docker_bridges}"
+        fi
     fi
 
-    # Fallback: common Docker default
-    if [[ -z "$networks" ]]; then
-        networks="172.17.0.0/16,172.18.0.0/16,172.19.0.0/16"
-    fi
-
-    echo "$networks"
-}
-
-# Detect Docker bridge networks (IPv6)
-detect_docker_networks_ipv6() {
-    local networks=""
-
-    if command -v docker &>/dev/null; then
-        networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | \
-            xargs -I {} docker network inspect {} --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | \
-            grep -E '^[0-9a-fA-F:]+/' | sort -u | tr '\n' ',' | sed 's/,$//')
-    fi
-
-    # Fallback: common Docker IPv6 defaults (if Docker has IPv6 enabled)
-    if [[ -z "$networks" ]]; then
-        networks="fd00::/80"
-    fi
-
-    echo "$networks"
+    echo "$ifaces"
 }
 
 # Check if Tailscale is connected
@@ -169,38 +161,6 @@ validate_interface_name() {
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-# Validate CIDR notation (security: prevent injection)
-validate_cidr() {
-    local cidr="$1"
-    # Match IPv4 CIDR: x.x.x.x/y where x is 0-255 and y is 0-32
-    if [[ ! "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
-        return 1
-    fi
-    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" mask="${BASH_REMATCH[5]}"
-    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 && mask <= 32 ))
-}
-
-# Validate IPv6 CIDR notation (security: prevent injection)
-validate_ipv6_cidr() {
-    local cidr="$1"
-    # Match IPv6 CIDR with stricter validation:
-    # - Must have at least one hex group before /prefix
-    # - Allows :: compression but not malformed patterns like ::::
-    # - Prefix must be 0-128
-    if [[ ! "$cidr" =~ ^([0-9a-fA-F]{1,4}:){0,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})$ ]] && \
-       [[ ! "$cidr" =~ ^([0-9a-fA-F]{1,4}:)*::([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] && \
-       [[ ! "$cidr" =~ ^::([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] && \
-       [[ ! "$cidr" =~ ^[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4}){7}/[0-9]{1,3}$ ]]; then
-        return 1
-    fi
-    # Reject multiple consecutive :: (invalid)
-    if [[ "$cidr" =~ :::+ ]]; then
-        return 1
-    fi
-    local prefix="${cidr##*/}"
-    (( prefix >= 0 && prefix <= 128 ))
 }
 
 # Ensure a writable temp directory for mktemp
@@ -292,7 +252,6 @@ apply_rules_atomic() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
-    local docker_nets="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -321,18 +280,21 @@ apply_rules_atomic() {
 # Allow loopback (localhost access)
 -A DOCKER-USER -i lo -j RETURN
 
-# Allow Docker internal networks (container-to-container)
+# Allow Docker bridge interfaces (traffic FROM containers)
+# -i matches the INPUT interface in FORWARD chain:
+#   Container -> Internet: enters via docker bridge -> RETURN (allowed)
+#   Internet -> Container: enters via WAN (eth0)   -> falls to DROP (blocked)
+#   Tailscale -> Container: enters via tailscale0   -> matched above (allowed)
+# Security: interface names cannot be spoofed (kernel-determined)
 EOF
 
-    # Add Docker network rules (with validation)
-    IFS=',' read -ra NETS <<< "$docker_nets"
-    for net in "${NETS[@]}"; do
-        if [[ -n "$net" ]]; then
-            if validate_cidr "$net"; then
-                echo "-A DOCKER-USER -s ${net} -j RETURN" >> "$rules_file"
-            else
-                log_warn "Skipping invalid CIDR: $net"
-            fi
+    # Add Docker bridge interface rules (primary: operational)
+    local docker_ifaces
+    docker_ifaces=$(detect_docker_interfaces)
+    IFS=',' read -ra IFACES <<< "$docker_ifaces"
+    for iface in "${IFACES[@]}"; do
+        if [[ -n "$iface" ]]; then
+            echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
         fi
     done
 
@@ -400,7 +362,6 @@ apply_rules_atomic_ipv6() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
-    local docker_nets_ipv6="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -429,18 +390,16 @@ apply_rules_atomic_ipv6() {
 # Allow loopback (localhost access)
 -A DOCKER-USER -i lo -j RETURN
 
-# Allow Docker internal networks (container-to-container)
+# Allow Docker bridge interfaces (container-to-container and container-to-internet)
 EOF
 
-    # Add Docker IPv6 network rules (with validation)
-    IFS=',' read -ra NETS <<< "$docker_nets_ipv6"
-    for net in "${NETS[@]}"; do
-        if [[ -n "$net" ]]; then
-            if validate_ipv6_cidr "$net"; then
-                echo "-A DOCKER-USER -s ${net} -j RETURN" >> "$rules_file"
-            else
-                log_warn "Skipping invalid IPv6 CIDR: $net"
-            fi
+    # Add Docker bridge interface rules
+    local docker_ifaces
+    docker_ifaces=$(detect_docker_interfaces)
+    IFS=',' read -ra IFACES <<< "$docker_ifaces"
+    for iface in "${IFACES[@]}"; do
+        if [[ -n "$iface" ]]; then
+            echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
         fi
     done
 
@@ -518,17 +477,12 @@ apply_firewall() {
     # Validate Tailscale interface exists
     validate_interface "$ts_iface" || die "Tailscale interface '$ts_iface' does not exist"
 
-    # Detect Docker networks (IPv4 and IPv6)
-    local docker_nets="${DOCKER_NETWORKS:-$(detect_docker_networks)}"
-    local docker_nets_ipv6="${DOCKER_NETWORKS_IPV6:-$(detect_docker_networks_ipv6)}"
-
-    # Log WAN interface for informational purposes (no longer used for blocking)
+    # Log detected configuration
     local wan_iface
     wan_iface=$(detect_wan_interface)
     log_info "WAN interface (detected): ${wan_iface:-NOT DETECTED}"
     log_info "Tailscale interface: $ts_iface"
-    log_info "Docker networks (IPv4): $docker_nets"
-    log_info "Docker networks (IPv6): $docker_nets_ipv6"
+    log_info "Docker interfaces: $(detect_docker_interfaces)"
 
     # Ensure chains exist (IPv4 and IPv6)
     ensure_docker_user_chain
@@ -539,13 +493,13 @@ apply_firewall() {
             # Default: Tailscale + specified public ports
             log_info "Public TCP ports: $PUBLIC_TCP_PORTS"
             log_info "Public UDP ports: $PUBLIC_UDP_PORTS"
-            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_nets"
-            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_nets_ipv6"
+            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS"
+            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS"
             ;;
         locked)
             # Only Tailscale, no public ports
-            apply_rules_atomic "$ts_iface" "none" "none" "$docker_nets"
-            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_nets_ipv6"
+            apply_rules_atomic "$ts_iface" "none" "none"
+            apply_rules_atomic_ipv6 "$ts_iface" "none" "none"
             ;;
         open)
             # Allow everything (bypass firewall)
@@ -707,7 +661,6 @@ Environment Variables:
   PUBLIC_TCP_PORTS    TCP ports to expose publicly (default: 80,443)
   PUBLIC_UDP_PORTS    UDP ports to expose publicly (default: 443)
   TS_IFACE            Tailscale interface (auto-detected)
-  DOCKER_NETWORKS     Docker networks CIDR (auto-detected)
 
 Examples:
   $0 apply                           # Apply guarded mode with defaults
