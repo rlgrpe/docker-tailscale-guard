@@ -74,7 +74,7 @@ detect_wan_interface() {
     local iface=""
 
     # Method 1: Default route
-    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    iface=$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
 
     # Method 2: First non-loopback, non-docker, non-tailscale interface with IP
     if [[ -z "$iface" || "$iface" == *" "* ]]; then
