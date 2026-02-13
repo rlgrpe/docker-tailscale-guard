@@ -25,9 +25,6 @@ PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-none}"
 # Tailscale interface (auto-detected if empty)
 TS_IFACE="${TS_IFACE:-}"
 
-# Docker networks to allow (comma-separated CIDR, auto-detected if empty)
-DOCKER_NETWORKS="${DOCKER_NETWORKS:-}"
-
 # Log file
 LOG_FILE="/var/log/docker-tailscale-guard.log"
 
@@ -37,10 +34,21 @@ LOG_FILE="/var/log/docker-tailscale-guard.log"
 
 # Initialize log file with secure permissions
 init_log_file() {
-    if [[ ! -f "$LOG_FILE" ]]; then
-        touch "$LOG_FILE"
+    # Security: refuse to write to symlinks (prevents symlink attacks)
+    if [[ -L "$LOG_FILE" ]]; then
+        LOG_FILE="/dev/null"
+        echo "[WARN] Log file is a symlink -- refusing to follow. Logging to stderr only." >&2
+        return
     fi
-    chmod 640 "$LOG_FILE"
+    if [[ ! -f "$LOG_FILE" ]]; then
+        if ! install -m 640 /dev/null "$LOG_FILE" 2>/dev/null; then
+            LOG_FILE="/dev/null"
+            echo "[WARN] Cannot create log file. Logging to stderr only." >&2
+            return
+        fi
+    else
+        chmod 640 "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
 log() {
@@ -66,7 +74,7 @@ detect_wan_interface() {
     local iface=""
 
     # Method 1: Default route
-    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    iface=$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
 
     # Method 2: First non-loopback, non-docker, non-tailscale interface with IP
     if [[ -z "$iface" || "$iface" == *" "* ]]; then
@@ -99,48 +107,53 @@ detect_tailscale_interface() {
     # Method 2: Any interface starting with tailscale
     elif iface=$(ip -o link show 2>/dev/null | grep -oP 'tailscale\w*' | head -1) && [[ -n "$iface" ]]; then
         : # iface already set
-    # Method 3: Check for userspace tailscale (tun)
+    # Method 3: Check for userspace tailscale (tun) -- verify with Tailscale IP
     elif ip link show tun0 &>/dev/null && pgrep -x tailscaled &>/dev/null; then
-        iface="tun0"
+        # Confirm tun0 is actually Tailscale by checking for 100.x.x.x address
+        if ip addr show tun0 2>/dev/null | grep -q 'inet 100\.'; then
+            iface="tun0"
+        fi
     fi
 
     echo "$iface"
 }
 
-# Detect Docker bridge networks (IPv4)
-detect_docker_networks() {
-    local networks=""
+# Detect Docker bridge interfaces
+# Returns comma-separated interface names for iptables -i matching
+# Dynamically detects actual Docker-managed bridges instead of wildcards
+detect_docker_interfaces() {
+    local ifaces=""
 
+    # Include default bridges only if they actually exist on the host
+    for default_iface in docker0 docker_gwbridge; do
+        if ip link show "$default_iface" &>/dev/null; then
+            ifaces="${ifaces:+${ifaces},}${default_iface}"
+        fi
+    done
+
+    # Detect actual Docker bridge interfaces (br-<network-id-prefix>)
     if command -v docker &>/dev/null; then
-        networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | \
-            xargs -I {} docker network inspect {} --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | \
-            grep -E '^[0-9]+\.' | sort -u | tr '\n' ',' | sed 's/,$//')
+        local docker_bridges
+        docker_bridges=$(docker network ls --format '{{.ID}}' 2>/dev/null | while read -r id; do
+            local short_id="${id:0:12}"
+            local br_name="br-${short_id}"
+            if ip link show "$br_name" &>/dev/null && validate_interface_name "$br_name"; then
+                echo "$br_name"
+            fi
+        done | sort -u | tr '\n' ',' | sed 's/,$//')
+
+        if [[ -n "$docker_bridges" ]]; then
+            ifaces="${ifaces:+${ifaces},}${docker_bridges}"
+        fi
     fi
 
-    # Fallback: common Docker default
-    if [[ -z "$networks" ]]; then
-        networks="172.17.0.0/16,172.18.0.0/16,172.19.0.0/16"
+    # Fallback: if nothing detected, use docker0 (iptables ignores non-existent interfaces)
+    if [[ -z "$ifaces" ]]; then
+        log_warn "No Docker bridge interfaces detected; using docker0 as fallback"
+        ifaces="docker0"
     fi
 
-    echo "$networks"
-}
-
-# Detect Docker bridge networks (IPv6)
-detect_docker_networks_ipv6() {
-    local networks=""
-
-    if command -v docker &>/dev/null; then
-        networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | \
-            xargs -I {} docker network inspect {} --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | \
-            grep -E '^[0-9a-fA-F:]+/' | sort -u | tr '\n' ',' | sed 's/,$//')
-    fi
-
-    # Fallback: common Docker IPv6 defaults (if Docker has IPv6 enabled)
-    if [[ -z "$networks" ]]; then
-        networks="fd00::/80"
-    fi
-
-    echo "$networks"
+    echo "$ifaces"
 }
 
 # Check if Tailscale is connected
@@ -171,45 +184,19 @@ validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
 }
 
-# Validate CIDR notation (security: prevent injection)
-validate_cidr() {
-    local cidr="$1"
-    # Match IPv4 CIDR: x.x.x.x/y where x is 0-255 and y is 0-32
-    if [[ ! "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
-        return 1
-    fi
-    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" mask="${BASH_REMATCH[5]}"
-    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 && mask <= 32 ))
-}
-
-# Validate IPv6 CIDR notation (security: prevent injection)
-validate_ipv6_cidr() {
-    local cidr="$1"
-    # Match IPv6 CIDR with stricter validation:
-    # - Must have at least one hex group before /prefix
-    # - Allows :: compression but not malformed patterns like ::::
-    # - Prefix must be 0-128
-    if [[ ! "$cidr" =~ ^([0-9a-fA-F]{1,4}:){0,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})$ ]] && \
-       [[ ! "$cidr" =~ ^([0-9a-fA-F]{1,4}:)*::([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] && \
-       [[ ! "$cidr" =~ ^::([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] && \
-       [[ ! "$cidr" =~ ^[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4}){7}/[0-9]{1,3}$ ]]; then
-        return 1
-    fi
-    # Reject multiple consecutive :: (invalid)
-    if [[ "$cidr" =~ :::+ ]]; then
-        return 1
-    fi
-    local prefix="${cidr##*/}"
-    (( prefix >= 0 && prefix <= 128 ))
-}
-
 # Ensure a writable temp directory for mktemp
 ensure_tmpdir() {
     local dir="${TMPDIR:-/run/docker-tailscale-guard}"
     if [[ -z "$dir" ]]; then
         dir="/run"
     fi
-    mkdir -p "$dir" 2>/dev/null || true
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        dir="/tmp"
+        if ! mkdir -p "$dir" 2>/dev/null; then
+            log_error "Cannot create temporary directory"
+            return 1
+        fi
+    fi
     echo "$dir"
 }
 
@@ -259,11 +246,15 @@ wait_for_docker_ready() {
 ensure_docker_user_chain() {
     if ! iptables -L DOCKER-USER -n &>/dev/null; then
         log_info "Creating DOCKER-USER chain (IPv4)"
-        iptables -N DOCKER-USER 2>/dev/null || true
-
-        # Insert jump to DOCKER-USER at the beginning of FORWARD chain if not exists
+        if ! iptables -N DOCKER-USER 2>&1; then
+            log_error "Failed to create DOCKER-USER chain (IPv4)"
+            return 1
+        fi
         if ! iptables -C FORWARD -j DOCKER-USER &>/dev/null; then
-            iptables -I FORWARD 1 -j DOCKER-USER 2>/dev/null || true
+            if ! iptables -I FORWARD 1 -j DOCKER-USER 2>&1; then
+                log_error "Failed to insert DOCKER-USER jump in FORWARD chain (IPv4)"
+                return 1
+            fi
         fi
     fi
 }
@@ -272,19 +263,29 @@ ensure_docker_user_chain() {
 ensure_docker_user_chain_ipv6() {
     if ! ip6tables -L DOCKER-USER -n &>/dev/null; then
         log_info "Creating DOCKER-USER chain (IPv6)"
-        ip6tables -N DOCKER-USER 2>/dev/null || true
-
-        # Insert jump to DOCKER-USER at the beginning of FORWARD chain if not exists
+        if ! ip6tables -N DOCKER-USER 2>&1; then
+            log_error "Failed to create DOCKER-USER chain (IPv6)"
+            return 1
+        fi
         if ! ip6tables -C FORWARD -j DOCKER-USER &>/dev/null; then
-            ip6tables -I FORWARD 1 -j DOCKER-USER 2>/dev/null || true
+            if ! ip6tables -I FORWARD 1 -j DOCKER-USER 2>&1; then
+                log_error "Failed to insert DOCKER-USER jump in FORWARD chain (IPv6)"
+                return 1
+            fi
         fi
     fi
 }
 
 # Flush DOCKER-USER chain safely (IPv4 and IPv6)
 flush_docker_user() {
-    iptables -F DOCKER-USER 2>/dev/null || true
-    ip6tables -F DOCKER-USER 2>/dev/null || true
+    if ! iptables -F DOCKER-USER 2>&1; then
+        log_error "Failed to flush DOCKER-USER chain (IPv4)"
+        return 1
+    fi
+    if ! ip6tables -F DOCKER-USER 2>&1; then
+        log_error "Failed to flush DOCKER-USER chain (IPv6)"
+        return 1
+    fi
 }
 
 # Apply rules atomically using iptables-restore (allowlist approach)
@@ -292,7 +293,7 @@ apply_rules_atomic() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
-    local docker_nets="$4"
+    local docker_ifaces="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -303,9 +304,6 @@ apply_rules_atomic() {
     local rules_file
     rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
-
-    # Ensure cleanup on exit/signals (security: prevent temp file leakage)
-    trap 'rm -f "$rules_file" 2>/dev/null' EXIT
 
     # Build DOCKER-USER rules (allowlist approach - allow safe, drop everything else)
     cat > "$rules_file" <<EOF
@@ -321,18 +319,21 @@ apply_rules_atomic() {
 # Allow loopback (localhost access)
 -A DOCKER-USER -i lo -j RETURN
 
-# Allow Docker internal networks (container-to-container)
+# Allow Docker bridge interfaces (traffic FROM containers)
+# -i matches the INPUT interface in FORWARD chain:
+#   Container -> Internet: enters via docker bridge -> RETURN (allowed)
+#   Internet -> Container: enters via WAN (eth0)   -> falls to DROP (blocked)
+#   Tailscale -> Container: enters via tailscale0   -> matched above (allowed)
+# Security: interface names cannot be spoofed (kernel-determined)
 EOF
 
-    # Add Docker network rules (with validation)
-    IFS=',' read -ra NETS <<< "$docker_nets"
-    for net in "${NETS[@]}"; do
-        if [[ -n "$net" ]]; then
-            if validate_cidr "$net"; then
-                echo "-A DOCKER-USER -s ${net} -j RETURN" >> "$rules_file"
-            else
-                log_warn "Skipping invalid CIDR: $net"
-            fi
+    # Add Docker bridge interface rules
+    IFS=',' read -ra IFACES <<< "$docker_ifaces"
+    for iface in "${IFACES[@]}"; do
+        if [[ -n "$iface" ]] && validate_interface_name "$iface"; then
+            echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
+        else
+            log_warn "Skipping invalid Docker interface: ${iface:-empty}"
         fi
     done
 
@@ -380,18 +381,35 @@ EOF
 COMMIT
 EOF
 
+    # Backup current rules before attempting changes
+    local backup_file
+    backup_file=$(mktemp -p "$(ensure_tmpdir)") || return 1
+    chmod 600 "$backup_file"
+    iptables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
+
+    # Flush existing rules to prevent accumulation (iptables-restore -n does not flush chains)
+    iptables -F DOCKER-USER 2>/dev/null || true
+
     # Apply rules atomically
     local result=0
     if iptables-restore -n < "$rules_file"; then
         log_info "IPv4 rules applied successfully"
     else
-        log_error "Failed to apply IPv4 rules"
+        log_error "Failed to apply IPv4 rules -- attempting rollback"
+        if [[ -s "$backup_file" ]]; then
+            if iptables-restore -n < "$backup_file" 2>/dev/null; then
+                log_warn "Rolled back to previous IPv4 rules"
+            else
+                log_error "CRITICAL: IPv4 rollback failed. DOCKER-USER chain may be empty. Run: docker-tailscale-guard.sh apply"
+            fi
+        else
+            log_error "CRITICAL: No backup available. DOCKER-USER chain may be empty."
+        fi
         result=1
     fi
 
-    # Cleanup handled by trap, but clear it to avoid affecting caller
-    rm -f "$rules_file" 2>/dev/null
-    trap - EXIT
+    # Explicit cleanup (no trap clobbering)
+    rm -f "$rules_file" "$backup_file" 2>/dev/null
     return $result
 }
 
@@ -400,7 +418,7 @@ apply_rules_atomic_ipv6() {
     local ts_iface="$1"
     local public_tcp="$2"
     local public_udp="$3"
-    local docker_nets_ipv6="$4"
+    local docker_ifaces="$4"
 
     # Validate Tailscale interface name (security: prevent injection)
     if ! validate_interface_name "$ts_iface"; then
@@ -411,9 +429,6 @@ apply_rules_atomic_ipv6() {
     local rules_file
     rules_file=$(mktemp -p "$(ensure_tmpdir)")
     chmod 600 "$rules_file"  # Secure temp file permissions
-
-    # Ensure cleanup on exit/signals (security: prevent temp file leakage)
-    trap 'rm -f "$rules_file" 2>/dev/null' EXIT
 
     # Build DOCKER-USER rules for IPv6
     cat > "$rules_file" <<EOF
@@ -429,18 +444,16 @@ apply_rules_atomic_ipv6() {
 # Allow loopback (localhost access)
 -A DOCKER-USER -i lo -j RETURN
 
-# Allow Docker internal networks (container-to-container)
+# Allow Docker bridge interfaces (container-to-container and container-to-internet)
 EOF
 
-    # Add Docker IPv6 network rules (with validation)
-    IFS=',' read -ra NETS <<< "$docker_nets_ipv6"
-    for net in "${NETS[@]}"; do
-        if [[ -n "$net" ]]; then
-            if validate_ipv6_cidr "$net"; then
-                echo "-A DOCKER-USER -s ${net} -j RETURN" >> "$rules_file"
-            else
-                log_warn "Skipping invalid IPv6 CIDR: $net"
-            fi
+    # Add Docker bridge interface rules
+    IFS=',' read -ra IFACES <<< "$docker_ifaces"
+    for iface in "${IFACES[@]}"; do
+        if [[ -n "$iface" ]] && validate_interface_name "$iface"; then
+            echo "-A DOCKER-USER -i ${iface} -j RETURN" >> "$rules_file"
+        else
+            log_warn "Skipping invalid Docker interface: ${iface:-empty}"
         fi
     done
 
@@ -481,18 +494,35 @@ EOF
 COMMIT
 EOF
 
+    # Backup current rules before attempting changes
+    local backup_file
+    backup_file=$(mktemp -p "$(ensure_tmpdir)") || return 1
+    chmod 600 "$backup_file"
+    ip6tables-save -t filter 2>/dev/null | grep -A 9999 'DOCKER-USER' > "$backup_file" || true
+
+    # Flush existing rules to prevent accumulation (ip6tables-restore -n does not flush chains)
+    ip6tables -F DOCKER-USER 2>/dev/null || true
+
     # Apply rules atomically
     local result=0
     if ip6tables-restore -n < "$rules_file"; then
         log_info "IPv6 rules applied successfully"
     else
-        log_error "Failed to apply IPv6 rules"
+        log_error "Failed to apply IPv6 rules -- attempting rollback"
+        if [[ -s "$backup_file" ]]; then
+            if ip6tables-restore -n < "$backup_file" 2>/dev/null; then
+                log_warn "Rolled back to previous IPv6 rules"
+            else
+                log_error "CRITICAL: IPv6 rollback failed. DOCKER-USER chain may be empty. Run: docker-tailscale-guard.sh apply"
+            fi
+        else
+            log_error "CRITICAL: No backup available. DOCKER-USER chain may be empty."
+        fi
         result=1
     fi
 
-    # Cleanup handled by trap, but clear it to avoid affecting caller
-    rm -f "$rules_file" 2>/dev/null
-    trap - EXIT
+    # Explicit cleanup (no trap clobbering)
+    rm -f "$rules_file" "$backup_file" 2>/dev/null
     return $result
 }
 
@@ -518,40 +548,43 @@ apply_firewall() {
     # Validate Tailscale interface exists
     validate_interface "$ts_iface" || die "Tailscale interface '$ts_iface' does not exist"
 
-    # Detect Docker networks (IPv4 and IPv6)
-    local docker_nets="${DOCKER_NETWORKS:-$(detect_docker_networks)}"
-    local docker_nets_ipv6="${DOCKER_NETWORKS_IPV6:-$(detect_docker_networks_ipv6)}"
+    # Detect Docker bridge interfaces once (avoid race between IPv4 and IPv6 application)
+    local docker_ifaces
+    docker_ifaces=$(detect_docker_interfaces)
 
-    # Log WAN interface for informational purposes (no longer used for blocking)
+    # Log detected configuration
     local wan_iface
     wan_iface=$(detect_wan_interface)
     log_info "WAN interface (detected): ${wan_iface:-NOT DETECTED}"
     log_info "Tailscale interface: $ts_iface"
-    log_info "Docker networks (IPv4): $docker_nets"
-    log_info "Docker networks (IPv6): $docker_nets_ipv6"
+    log_info "Docker interfaces: $docker_ifaces"
 
     # Ensure chains exist (IPv4 and IPv6)
-    ensure_docker_user_chain
-    ensure_docker_user_chain_ipv6
+    ensure_docker_user_chain || die "Failed to ensure DOCKER-USER chain (IPv4)"
+    ensure_docker_user_chain_ipv6 || die "Failed to ensure DOCKER-USER chain (IPv6)"
 
     case "$mode" in
         guarded)
             # Default: Tailscale + specified public ports
             log_info "Public TCP ports: $PUBLIC_TCP_PORTS"
             log_info "Public UDP ports: $PUBLIC_UDP_PORTS"
-            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_nets"
-            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_nets_ipv6"
+            apply_rules_atomic "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces" \
+                || die "Failed to apply IPv4 firewall rules"
+            apply_rules_atomic_ipv6 "$ts_iface" "$PUBLIC_TCP_PORTS" "$PUBLIC_UDP_PORTS" "$docker_ifaces" \
+                || die "Failed to apply IPv6 firewall rules"
             ;;
         locked)
             # Only Tailscale, no public ports
-            apply_rules_atomic "$ts_iface" "none" "none" "$docker_nets"
-            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_nets_ipv6"
+            apply_rules_atomic "$ts_iface" "none" "none" "$docker_ifaces" \
+                || die "Failed to apply IPv4 firewall rules"
+            apply_rules_atomic_ipv6 "$ts_iface" "none" "none" "$docker_ifaces" \
+                || die "Failed to apply IPv6 firewall rules"
             ;;
         open)
             # Allow everything (bypass firewall)
-            flush_docker_user
-            iptables -A DOCKER-USER -j RETURN
-            ip6tables -A DOCKER-USER -j RETURN
+            flush_docker_user || die "Failed to flush firewall rules for open mode"
+            iptables -A DOCKER-USER -j RETURN || die "Failed to add IPv4 RETURN rule"
+            ip6tables -A DOCKER-USER -j RETURN || die "Failed to add IPv6 RETURN rule"
             log_info "Firewall opened - all traffic allowed (IPv4 and IPv6)"
             ;;
         *)
@@ -651,20 +684,22 @@ health_check() {
         ((errors++))
     fi
 
-    # Check DOCKER-USER chain exists and has rules (IPv4)
+    # Check DOCKER-USER chain exists and has DROP rule (IPv4)
     if ! iptables -L DOCKER-USER -n &>/dev/null; then
         log_error "Health check failed: DOCKER-USER chain missing (IPv4)"
         ((errors++))
-    elif ! iptables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP\|tailscale"; then
-        log_warn "Health check warning: DOCKER-USER chain may be empty or misconfigured (IPv4)"
+    elif ! iptables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP"; then
+        log_error "Health check failed: DOCKER-USER chain has no DROP rule (IPv4) -- containers may be exposed"
+        ((errors++))
     fi
 
-    # Check DOCKER-USER chain exists and has rules (IPv6)
+    # Check DOCKER-USER chain exists and has DROP rule (IPv6)
     if ! ip6tables -L DOCKER-USER -n &>/dev/null; then
         log_error "Health check failed: DOCKER-USER chain missing (IPv6)"
         ((errors++))
-    elif ! ip6tables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP\|tailscale"; then
-        log_warn "Health check warning: DOCKER-USER chain may be empty or misconfigured (IPv6)"
+    elif ! ip6tables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP"; then
+        log_error "Health check failed: DOCKER-USER chain has no DROP rule (IPv6) -- containers may be exposed"
+        ((errors++))
     fi
 
     # Check Tailscale connectivity
@@ -704,10 +739,9 @@ Modes:
   open      Disable firewall (allow all traffic)
 
 Environment Variables:
-  PUBLIC_TCP_PORTS    TCP ports to expose publicly (default: 80,443)
-  PUBLIC_UDP_PORTS    UDP ports to expose publicly (default: 443)
+  PUBLIC_TCP_PORTS    TCP ports to expose publicly (default: none)
+  PUBLIC_UDP_PORTS    UDP ports to expose publicly (default: none)
   TS_IFACE            Tailscale interface (auto-detected)
-  DOCKER_NETWORKS     Docker networks CIDR (auto-detected)
 
 Examples:
   $0 apply                           # Apply guarded mode with defaults

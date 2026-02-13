@@ -1,5 +1,5 @@
 [Unit]
-Description=Docker Tailscale Guard Health Check and Auto-Recovery
+Description=Docker Tailscale Guard Health Check and Rule Refresh
 After=docker-tailscale-guard.service
 Requires=docker-tailscale-guard.service
 
@@ -8,4 +8,25 @@ OnFailure=docker-tailscale-guard.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/docker-tailscale-guard.sh health
+
+# Re-apply rules to pick up new Docker networks, then health check
+ExecStart=/usr/local/sbin/docker-tailscale-guard.sh apply
+ExecStartPost=/usr/local/sbin/docker-tailscale-guard.sh health
+
+# Environment (same as main service)
+EnvironmentFile=-/etc/docker-tailscale-guard.conf
+Environment=TMPDIR=/run/docker-tailscale-guard
+
+# Hardening (mirrors main service)
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+ReadWritePaths=/var/log /run/docker-tailscale-guard
