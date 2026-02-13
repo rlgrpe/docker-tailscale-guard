@@ -664,20 +664,22 @@ health_check() {
         ((errors++))
     fi
 
-    # Check DOCKER-USER chain exists and has rules (IPv4)
+    # Check DOCKER-USER chain exists and has DROP rule (IPv4)
     if ! iptables -L DOCKER-USER -n &>/dev/null; then
         log_error "Health check failed: DOCKER-USER chain missing (IPv4)"
         ((errors++))
-    elif ! iptables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP\|tailscale"; then
-        log_warn "Health check warning: DOCKER-USER chain may be empty or misconfigured (IPv4)"
+    elif ! iptables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP"; then
+        log_error "Health check failed: DOCKER-USER chain has no DROP rule (IPv4) -- containers may be exposed"
+        ((errors++))
     fi
 
-    # Check DOCKER-USER chain exists and has rules (IPv6)
+    # Check DOCKER-USER chain exists and has DROP rule (IPv6)
     if ! ip6tables -L DOCKER-USER -n &>/dev/null; then
         log_error "Health check failed: DOCKER-USER chain missing (IPv6)"
         ((errors++))
-    elif ! ip6tables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP\|tailscale"; then
-        log_warn "Health check warning: DOCKER-USER chain may be empty or misconfigured (IPv6)"
+    elif ! ip6tables -L DOCKER-USER -n 2>/dev/null | grep -q "DROP"; then
+        log_error "Health check failed: DOCKER-USER chain has no DROP rule (IPv6) -- containers may be exposed"
+        ((errors++))
     fi
 
     # Check Tailscale connectivity
