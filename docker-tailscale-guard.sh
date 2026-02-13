@@ -34,10 +34,21 @@ LOG_FILE="/var/log/docker-tailscale-guard.log"
 
 # Initialize log file with secure permissions
 init_log_file() {
-    if [[ ! -f "$LOG_FILE" ]]; then
-        touch "$LOG_FILE"
+    # Security: refuse to write to symlinks (prevents symlink attacks)
+    if [[ -L "$LOG_FILE" ]]; then
+        LOG_FILE="/dev/null"
+        echo "[WARN] Log file is a symlink -- refusing to follow. Logging to stderr only." >&2
+        return
     fi
-    chmod 640 "$LOG_FILE"
+    if [[ ! -f "$LOG_FILE" ]]; then
+        if ! install -m 640 /dev/null "$LOG_FILE" 2>/dev/null; then
+            LOG_FILE="/dev/null"
+            echo "[WARN] Cannot create log file. Logging to stderr only." >&2
+            return
+        fi
+    else
+        chmod 640 "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
 log() {
